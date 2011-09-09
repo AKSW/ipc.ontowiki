@@ -22,11 +22,10 @@ class IpcController extends OntoWiki_Controller_Component
 
     protected $filterPattern = '/^[a-zA-Z]+(-[a-zA-Z0-9]+)*(\/[a-zA-Z]+(-[a-zA-Z0-9]+)*)*$/';
 
-    private   $preferences = array(
-        'quality'   => 80,
-        'debug'     => 1,
-        'debugtype' => 'png'
-    );
+
+    private $cacheDirectory = null;
+    private $imgFile        = null;
+    private $imgUrl         = null;
 
     /**
      * Constructor
@@ -37,10 +36,9 @@ class IpcController extends OntoWiki_Controller_Component
         parent::init();
         // init controller variables
         $this->store     = $this->_owApp->erfurt->getStore();
-        $this->_config   = $this->_owApp->config;
+        $this->config   = $this->_owApp->config;
         $this->response  = Zend_Controller_Front::getInstance()->getResponse();
         $this->request   = Zend_Controller_Front::getInstance()->getRequest();
-        $this->cachePath = $this->_config->cache->path;
     }
 
     /**
@@ -50,37 +48,16 @@ class IpcController extends OntoWiki_Controller_Component
     {
         // this action needs no view
         $this->_helper->viewRenderer->setNoRender();
+
         // disable layout
         $this->_helper->layout()->disableLayout();
 
-        // check for image url
-        if (!isset($this->request->img)) {
-            throw new OntoWiki_Exception('No img url given.');
-            exit;
-        }
-        $this->imgUrl = $this->request->img;
-        // check for general uri syntax
-        if (!Erfurt_Uri::check($this->imgUrl)) {
-            throw new OntoWiki_Exception('Given img url is not a valid url.');
-            exit;
-        }
-        // check for specific image uri syntax
-        if (preg_match ($this->urlPattern, $this->imgUrl) != 1){
-            throw new OntoWiki_Exception('Given img url is not valid');
-            exit;
-        }
-        // check for filter parameter
-        $filter = (!isset($this->request->filter)) ? '' : $this->request->filter;
+        // download the image and save it to a proxy file
+        $this->processImgUrl();
 
-        //var_dump(preg_match ($this->filterPattern, $filter), $filter); exit;
-        if (preg_match ($this->filterPattern, $filter) != 1){
-            throw new OntoWiki_Exception("Given filter string is not valid: $filter");
-        }
-        // split filter string into different filter
-        $filter = explode ('/', $filter);
-
-        // download image and save to
-        $this->downloadImage();
+        /*
+         * from here it is reused IPC code
+         */
 
         // load base classes and functions
         require_once('instantpicture.inc.php');
@@ -88,18 +65,171 @@ class IpcController extends OntoWiki_Controller_Component
         require_once('filters/Palette.filter.php');
         require_once('filters/Resize.filter.php');
 
-        $cacheName   = cacheName($this->picture, $filter, 'mixed', false);
-        $cacheFile   = $this->cachePath . $cacheName;
+        // split filter string into different filter
+        $filter = $this->getFilterArray();
 
-        $img = new InstantPicture($this->preferences);
-        $img->apply($this->picture, $filter);
+        $cacheName   = cacheName($this->getImgFile(), $filter, 'mixed', false);
+        $cacheFile   = $this->getCacheDirectory() . $cacheName;
+
+        $preferences = array(
+            'quality' => 80,
+            'debug'   => 1,
+            'debugtype' => 'png'
+        );
+        $img = new InstantPicture($preferences);
+        $img->apply($this->getImgFile(), $filter);
         $img->imageSaveToFile($cacheFile);
         $img->flush($cacheFile);
     }
 
-    private function downloadImage()
+    /*
+     * returns the filter description as an array
+     */
+    private function getFilterArray()
     {
-        $this->picture = '/tmp/ttt.png';
+        // check for filter parameter
+        if (!isset($this->request->filter)) {
+            // empty filter -> empty array
+            return array();
+        } else {
+            if (preg_match ($this->filterPattern, $this->request->filter) != 1){
+                throw new OntoWiki_Exception("Given filter string is not valid: $filter");
+            } else {
+                return explode ('/', $this->request->filter);
+            }
+        }
     }
 
+    /*
+     * downloads the image (or just reuses the cached file)
+     */
+    private function processImgUrl()
+    {
+        if (file_exists($this->getImgFile())) {
+            // if cache exists and is older (lower int value) -> download
+            if ($this->getImgUrlModification() > $this->getImgFileModification() ) {
+                $this->downloadImgUrl();
+            }
+            // if cache exists and is newer (higher int value) -> do nothing
+        } else {
+            // if no cached file exists -> download
+            $this->downloadImgUrl();
+        }
+    }
+
+    /*
+     * the real download of the image
+     */
+    private function downloadImgUrl()
+    {
+        $curl = curl_init($this->getImgUrl());
+        $file = fopen($this->getImgFile(), "wb");
+
+        // set URL and other appropriate options
+        $options = array(
+            CURLOPT_FILE => $file,
+            CURLOPT_HEADER => 0,
+            CURLOPT_FOLLOWLOCATION => 1,
+            CURLOPT_TIMEOUT => 20
+        );
+
+        curl_setopt_array($curl, $options);
+        curl_exec($curl);
+
+        curl_close($curl);
+        fclose($file);
+    }
+
+    /*
+     * returns the imgFile modification timestamp as int
+     * http://stackoverflow.com/questions/845220/
+     */
+    private function getImgFileModification()
+    {
+        return (int) filemtime($this->getImgFile());
+    }
+
+    /*
+     * returns the imgUrl modification timestamp as int (or now if not available)
+     * http://stackoverflow.com/questions/845220/
+     */
+    private function getImgUrlModification()
+    {
+        $curl = curl_init($this->getImgUrl());
+        // don't fetch the actual page, you only want headers
+        curl_setopt($curl, CURLOPT_NOBODY, true);
+        // stop it from outputting stuff to stdout
+        curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+        // attempt to retrieve the modification date
+        curl_setopt($curl, CURLOPT_FILETIME, true);
+        // run curl
+        $result = curl_exec($curl);
+
+        if ($result === false) {
+            die (curl_error($curl));
+        }
+
+        $timestamp = curl_getinfo($curl, CURLINFO_FILETIME);
+        if ($timestamp != -1) { //otherwise unknown -> now
+            return (int) $timestamp;
+        } else {
+            $timestamp = new DateTime("now");
+            return (int) $timestamp->format ("U");;
+        }
+    }
+
+    /*
+     * returns the image cache path as string
+     */
+    private function getCacheDirectory()
+    {
+        if ($this->cacheDirectory == null) {
+            if (is_writable ($this->config->cache->path)) {
+                $this->cacheDirectory = $this->config->cache->path;
+            } elseif (is_writable (sys_get_temp_dir())) {
+                $this->cacheDirectory = sys_get_temp_dir() . '/';
+            } else {
+                throw new OntoWiki_Exception('No writeable cache directory available');
+                exit;
+            }
+        }
+        return $this->cacheDirectory;
+    }
+
+    /*
+     * returns the downloaded "proxy image" filename as string
+     */
+    private function getImgFile()
+    {
+        if ($this->imgFile == null) {
+            $this->imgFile = $this->getCacheDirectory() . 'ipc-' . md5($this->getImgUrl());
+        }
+        return $this->imgFile;
+    }
+
+    /*
+     * returns the requested img url as string
+     */
+    private function getImgUrl()
+    {
+        if ($this->imgUrl == null) {
+            // check for image url
+            if (!isset($this->request->img)) {
+                throw new OntoWiki_Exception('No img url given.');
+                exit;
+            }
+            $this->imgUrl = $this->request->img;
+            // check for general uri syntax
+            if (!Erfurt_Uri::check($this->imgUrl)) {
+                throw new OntoWiki_Exception('Given img url is not a valid url.');
+                exit;
+            }
+            // check for specific image uri syntax
+            if (preg_match ($this->urlPattern, $this->imgUrl) != 1){
+                throw new OntoWiki_Exception('Given img url is not valid');
+                exit;
+            }
+        }
+        return (string) $this->imgUrl;
+    }
 }
