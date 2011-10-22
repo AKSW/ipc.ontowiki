@@ -105,9 +105,21 @@ class IpcController extends OntoWiki_Controller_Component
      */
     private function processImgUrl()
     {
+        // how long to we save without even test for a new version
+        if (isset($this->_privateConfig->livetime)) {
+            $livetime = $this->_privateConfig->livetime;
+        } else {
+            $livetime = 86400; // default livetime is one day
+        }
+        // this is the latest timestamp we allow to exist on a saved image
+        $latest = new DateTime("now");
+        $latest = (int) $latest->format ("U") - $livetime;
+
         if (file_exists($this->getImgFile())) {
             // if cache exists and is older (lower int value) -> download
-            if ($this->getImgUrlModification() > $this->getImgFileModification() ) {
+            if ($this->getImgFileModification() > $latest) {
+                // do nothing
+            } elseif ($this->getImgUrlModification() > $this->getImgFileModification() ) {
                 $this->downloadImgUrl();
             }
             // if cache exists and is newer (higher int value) -> do nothing
